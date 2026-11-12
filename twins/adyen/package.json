@@ -1,0 +1,12 @@
+{
+  "name": "@tesseract/twin-adyen",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stateful Adyen twin whose clock is the Tesseract world clock",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "start": "node --no-warnings src/main.ts",
+    "test": "node --no-warnings --test test/*.test.ts"
+  }
+}
