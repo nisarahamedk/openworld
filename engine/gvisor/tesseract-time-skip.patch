@@ -1,0 +1,764 @@
+diff --git a/pkg/sentry/kernel/kernel.go b/pkg/sentry/kernel/kernel.go
+index 49b0228..b179e82 100644
+--- a/pkg/sentry/kernel/kernel.go
++++ b/pkg/sentry/kernel/kernel.go
+@@ -1676,6 +1676,7 @@ func (k *Kernel) Start() error {
+ 	k.cpuClockTickerRunning = true
+ 	k.runningTasksMu.Unlock()
+ 	go k.runCPUClockTicker()
++	k.startTimeSkipper()
+ 	// If k was created by LoadKernelFrom, timers were stopped during
+ 	// Kernel.SaveTo and need to be resumed. If k was created by NewKernel,
+ 	// this is a no-op.
+diff --git a/pkg/sentry/kernel/tesseract.go b/pkg/sentry/kernel/tesseract.go
+new file mode 100644
+index 0000000..c9c01c5
+--- /dev/null
++++ b/pkg/sentry/kernel/tesseract.go
+@@ -0,0 +1,261 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package kernel
++
++// Tesseract time skipping (spike).
++//
++// While any task runs, time flows at real speed. When every task in the
++// sandbox has been blocked for a short grace period, the skipper moves all
++// clocks forward to the earliest armed timer deadline, so the program that
++// owns that timer wakes immediately. Time only ever moves forward.
++//
++// Enabled with TESS_SKIP=1 in runsc's environment. Optional:
++//   TESS_GRACE_US   idle time required before a skip (default 2000)
++//   TESS_QUANTUM_MS round skip targets up to a multiple of this (default 0)
++//   TESS_POLL_US    idle check interval (default 200)
++
++import (
++	"math"
++	"os"
++	"strconv"
++	"time"
++
++	"gvisor.dev/gvisor/pkg/atomicbitops"
++	"gvisor.dev/gvisor/pkg/log"
++	"gvisor.dev/gvisor/pkg/sentry/ktime"
++	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
++)
++
++// TessNetTx and TessNetRx count bytes written to and read from TCP sockets
++// that leave the sandbox (hostinet). Across a world, their difference is
++// the number of bytes in flight.
++var TessNetTx, TessNetRx atomicbitops.Uint64
++
++// tessIdleSince is the host monotonic time (ns) since which no task has
++// run, or 0 while some task is running. Maintained by the skipper goroutine.
++var tessIdleSince atomicbitops.Int64
++
++// TessState is what a sandbox reports to a world coordinator.
++type TessState struct {
++	Running     int64 // tasks running now
++	IdleNs      int64 // how long no task has run (0 if busy)
++	UntilNextNs int64 // time until the earliest armed timer
++	HasNext     bool  // whether any timer is armed
++	MonoNs      int64 // the sandbox's CLOCK_MONOTONIC
++	RealNs      int64 // the sandbox's CLOCK_REALTIME
++	SkewNs      int64 // total time skipped
++	NetTx       uint64
++	NetRx       uint64
++}
++
++// tessSkipGen counts skips, so idle tracking restarts after each one.
++var tessSkipGen atomicbitops.Int64
++
++// TessSkip moves every clock forward by d and restarts idle tracking.
++func (k *Kernel) TessSkip(d time.Duration) {
++	tessIdleSince.Store(0)
++	tessSkipGen.Add(1)
++	k.timekeeper.Skip(d)
++}
++
++// TessState samples this sandbox's state for a world coordinator.
++func (k *Kernel) TessState() TessState {
++	tk := k.timekeeper
++	var st TessState
++	st.Running = k.runningTasks.Load()
++	if since := tessIdleSince.Load(); since != 0 && st.Running == 0 {
++		st.IdleNs = time.Now().UnixNano() - since
++	}
++	d, ok := tk.UntilNextDeadline()
++	st.UntilNextNs, st.HasNext = int64(d), ok
++	st.MonoNs, _ = tk.GetTime(sentrytime.Monotonic)
++	st.RealNs, _ = tk.GetTime(sentrytime.Realtime)
++	st.SkewNs = int64(tk.Skewed())
++	st.NetTx, st.NetRx = TessNetTx.Load(), TessNetRx.Load()
++	return st
++}
++
++type trackedDeadline struct {
++	clock sentrytime.ClockID
++	next  ktime.Time
++}
++
++// trackDeadline records the setting of a SampledTimer on clock c.
++func (t *Timekeeper) trackDeadline(c sentrytime.ClockID, key *ktime.SampledTimer, s ktime.Setting) {
++	t.deadlineMu.Lock()
++	defer t.deadlineMu.Unlock()
++	if !s.Enabled {
++		delete(t.deadlines, key)
++		return
++	}
++	if t.deadlines == nil {
++		t.deadlines = make(map[*ktime.SampledTimer]trackedDeadline)
++	}
++	t.deadlines[key] = trackedDeadline{clock: c, next: s.Next}
++}
++
++// UntilNextDeadline returns how long until the earliest armed timer on any
++// timekeeper clock (including netstack timers) is due, and false if no timer
++// is armed.
++func (t *Timekeeper) UntilNextDeadline() (time.Duration, bool) {
++	best := int64(math.MaxInt64)
++	now := map[sentrytime.ClockID]int64{}
++	clockNow := func(c sentrytime.ClockID) int64 {
++		if v, ok := now[c]; ok {
++			return v
++		}
++		v, err := t.GetTime(c)
++		if err != nil {
++			panic(err)
++		}
++		now[c] = v
++		return v
++	}
++	t.deadlineMu.Lock()
++	for _, d := range t.deadlines {
++		if rem := d.next.Nanoseconds() - clockNow(d.clock); rem < best {
++			best = rem
++		}
++	}
++	t.deadlineMu.Unlock()
++	if target := t.afterFuncSchedulerTarget.Load(); target != math.MaxInt64 {
++		if rem := target - clockNow(sentrytime.Monotonic); rem < best {
++			best = rem
++		}
++	}
++	if best == math.MaxInt64 {
++		return 0, false
++	}
++	return time.Duration(best), true
++}
++
++// Skip moves every clock forward by d and makes all timers re-check their
++// deadlines.
++func (t *Timekeeper) Skip(d time.Duration) {
++	if d <= 0 {
++		return
++	}
++	t.skew.Add(int64(d))
++	t.updateMu.Lock()
++	if t.params != nil {
++		t.update(false)
++	}
++	t.updateMu.Unlock()
++	for _, c := range []*timekeeperClock{t.realtimeClock, t.monotonicClock, t.boottimeClock, t.monotonicRawClock} {
++		if c != nil {
++			c.queue.Notify(ktime.ClockEventSet)
++		}
++	}
++	select {
++	case t.afterFuncSchedulerWakeCh <- struct{}{}:
++	default:
++	}
++}
++
++// Skewed returns the total time skipped so far.
++func (t *Timekeeper) Skewed() time.Duration {
++	return time.Duration(t.skew.Load())
++}
++
++// worldClockFrozenAcrossRestore reports whether a restored sandbox should
++// resume at the exact world time it was saved at (TESS_SKIP=1 or
++// TESS_FREEZE=1), instead of Linux's default of letting wall time jump forward.
++func worldClockFrozenAcrossRestore() bool {
++	return os.Getenv("TESS_SKIP") == "1" || os.Getenv("TESS_FREEZE") == "1"
++}
++
++func envInt(name string, def int64) int64 {
++	if v, err := strconv.ParseInt(os.Getenv(name), 10, 64); err == nil {
++		return v
++	}
++	return def
++}
++
++// startTimeSkipper starts the time-skipping goroutine if TESS_SKIP=1, or
++// only the idle tracker if TESS_SKIP=coord (a world coordinator outside the
++// sandbox then decides when to skip, through the Tesseract control RPCs).
++func (k *Kernel) startTimeSkipper() {
++	mode := os.Getenv("TESS_SKIP")
++	if mode != "1" && mode != "coord" {
++		return
++	}
++	grace := time.Duration(envInt("TESS_GRACE_US", 2000)) * time.Microsecond
++	poll := time.Duration(envInt("TESS_POLL_US", 200)) * time.Microsecond
++	quantum := envInt("TESS_QUANTUM_MS", 0) * int64(time.Millisecond)
++	const minSkip = time.Millisecond
++	tk := k.timekeeper
++	log.Infof("tesseract: time skipping mode %q (grace %v, quantum %vns)", mode, grace, quantum)
++	go func() { // S/R-UNSAFE: spike only.
++		var idleSince time.Time
++		var skips int64
++		var lastTx uint64
++		var lastGen int64
++		for {
++			time.Sleep(poll)
++			if gen := tessSkipGen.Load(); gen != lastGen {
++				// Someone (a coordinator) skipped time: timers are firing
++				// and tasks are waking, so idleness must be observed anew.
++				lastGen = gen
++				idleSince = time.Time{}
++				tessIdleSince.Store(0)
++				continue
++			}
++			if k.runningTasks.Load() != 0 {
++				idleSince = time.Time{}
++				tessIdleSince.Store(0)
++				continue
++			}
++			if idleSince.IsZero() {
++				idleSince = time.Now()
++				tessIdleSince.Store(idleSince.UnixNano())
++				continue
++			}
++			if TessNetTx.Load() != TessNetRx.Load() {
++				continue // bytes in flight: someone is about to wake
++			}
++			if time.Since(idleSince) < grace {
++				continue
++			}
++			if mode == "coord" {
++				continue
++			}
++			d, ok := tk.UntilNextDeadline()
++			if !ok || d < minSkip {
++				continue // nothing armed, or a timer is (nearly) due: its owner is about to wake
++			}
++			// Adaptive quantum: exact skips while network traffic flows
++			// (see tesscoord), rounded-up batched skips when quiet.
++			tx := TessNetTx.Load()
++			talking := tx != lastTx
++			lastTx = tx
++			if quantum > 0 && !talking {
++				mono, _ := tk.GetTime(sentrytime.Monotonic)
++				target := mono + int64(d)
++				target = (target + quantum - 1) / quantum * quantum
++				d = time.Duration(target - mono)
++			}
++			if d < minSkip {
++				continue
++			}
++			k.TessSkip(d)
++			lastGen = tessSkipGen.Load()
++			skips++
++			if skips%1000 == 1 {
++				log.Infof("tesseract: skip #%d by %v, total skipped %v", skips, d, tk.Skewed())
++			}
++			idleSince = time.Time{}
++		}
++	}()
++}
+diff --git a/pkg/sentry/kernel/timekeeper.go b/pkg/sentry/kernel/timekeeper.go
+index b73f716..333cfc2 100644
+--- a/pkg/sentry/kernel/timekeeper.go
++++ b/pkg/sentry/kernel/timekeeper.go
+@@ -25,6 +25,7 @@ import (
+ 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
+ 	"gvisor.dev/gvisor/pkg/sync"
+ 	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/waiter"
+ )
+ 
+ // Possible values of Timekeeper.updaterState
+@@ -120,6 +121,17 @@ type Timekeeper struct {
+ 	// It is only used after restore, to compute the new boottimeOffset.
+ 	saveRealtime int64
+ 
++	// skew is the total time skipped by Tesseract time skipping, in ns. It is
++	// added to CLOCK_MONOTONIC, CLOCK_BOOTTIME and CLOCK_REALTIME.
++	skew atomicbitops.Int64 `state:"nosave"`
++
++	// deadlineMu protects deadlines.
++	deadlineMu sync.Mutex `state:"nosave"`
++
++	// deadlines holds the setting of every armed SampledTimer on a
++	// timekeeper clock, so the earliest deadline can be found.
++	deadlines map[*ktime.SampledTimer]trackedDeadline `state:"nosave"`
++
+ 	// mu protects destruction with stop and wg.
+ 	mu sync.Mutex `state:"nosave"`
+ 
+@@ -296,14 +308,14 @@ func (t *Timekeeper) vdsoParamsLocked(res sentrytime.UpdateResult) vdsoParams {
+ 	if res.MonotonicOk && !t.restoring.Load() {
+ 		p.monotonicReady = 1
+ 		p.monotonicBaseCycles = int64(res.Monotonic.BaseCycles)
+-		p.monotonicBaseRef = int64(res.Monotonic.BaseRef) + t.monotonicOffset
++		p.monotonicBaseRef = int64(res.Monotonic.BaseRef) + t.monotonicOffset + t.skew.Load()
+ 		p.monotonicFrequency = res.Monotonic.Frequency
+ 		p.boottimeOffset = t.boottimeOffset
+ 	}
+ 	if res.RealtimeOk {
+ 		p.realtimeReady = 1
+ 		p.realtimeBaseCycles = int64(res.Realtime.BaseCycles)
+-		p.realtimeBaseRef = int64(res.Realtime.BaseRef)
++		p.realtimeBaseRef = int64(res.Realtime.BaseRef) + t.skew.Load()
+ 		p.realtimeFrequency = res.Realtime.Frequency
+ 	}
+ 	if t.monotonicRawClock == nil {
+@@ -529,9 +541,18 @@ func (t *Timekeeper) endRestore() {
+ 				panic("Unable to get current realtime: " + err.Error())
+ 			}
+ 		}
+-		t.monotonicOffset = t.saveMonotonic - nowMonotonic
+-		if elapsed := nowRealtime - t.saveRealtime; elapsed > 0 {
+-			t.boottimeOffset += elapsed
++		if worldClockFrozenAcrossRestore() {
++			// Tesseract: the world was frozen while saved. Every clock,
++			// wall clock included, continues from exactly where it stopped,
++			// so a fork restored later (or many times) starts at the same
++			// world time as the original.
++			t.skew.Store(t.saveRealtime - nowRealtime)
++			t.monotonicOffset = t.saveMonotonic - nowMonotonic - t.skew.Load()
++		} else {
++			t.monotonicOffset = t.saveMonotonic - nowMonotonic
++			if elapsed := nowRealtime - t.saveRealtime; elapsed > 0 {
++				t.boottimeOffset += elapsed
++			}
+ 		}
+ 		t.restoring.Store(false)
+ 		return t.vdsoParamsLocked(res)
+@@ -581,8 +602,11 @@ func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
+ 	defer t.release()
+ 
+ 	now, err := t.clocks.GetTime(c)
++	if err == nil && c == sentrytime.Realtime {
++		now += t.skew.Load()
++	}
+ 	if err == nil && c == sentrytime.Monotonic {
+-		now += t.monotonicOffset
++		now += t.monotonicOffset + t.skew.Load()
+ 		for {
+ 			// It's possible that the clock is shaky. This may be due to
+ 			// platform issues, e.g. the KVM platform relies on the guest
+@@ -621,9 +645,31 @@ type timekeeperClock struct {
+ 	// Implements ktime.SampledClock.WallTimeUntil.
+ 	ktime.WallRateClock `state:"nosave"`
+ 
+-	// Implements waiter.Waitable. (We have no ability to detect
+-	// discontinuities from external changes to CLOCK_REALTIME).
+-	ktime.NoClockEvents `state:"nosave"`
++	// queue implements waiter.Waitable. It is notified with
++	// ktime.ClockEventSet when time skips forward, so that timers re-check
++	// their deadlines.
++	queue waiter.Queue `state:"nosave"`
++}
++
++// Readiness implements waiter.Waitable.Readiness.
++func (tc *timekeeperClock) Readiness(mask waiter.EventMask) waiter.EventMask {
++	return 0
++}
++
++// EventRegister implements waiter.Waitable.EventRegister.
++func (tc *timekeeperClock) EventRegister(e *waiter.Entry) error {
++	tc.queue.EventRegister(e)
++	return nil
++}
++
++// EventUnregister implements waiter.Waitable.EventUnregister.
++func (tc *timekeeperClock) EventUnregister(e *waiter.Entry) {
++	tc.queue.EventUnregister(e)
++}
++
++// TrackDeadline implements ktime.DeadlineTracker.
++func (tc *timekeeperClock) TrackDeadline(key *ktime.SampledTimer, s ktime.Setting) {
++	tc.tk.trackDeadline(tc.c, key, s)
+ }
+ 
+ // Now implements ktime.Clock.Now.
+diff --git a/pkg/sentry/ktime/sampled_timer.go b/pkg/sentry/ktime/sampled_timer.go
+index 38771e6..a9c58f4 100644
+--- a/pkg/sentry/ktime/sampled_timer.go
++++ b/pkg/sentry/ktime/sampled_timer.go
+@@ -126,6 +126,7 @@ func (t *SampledTimer) Destroy() {
+ 	t.setting.Enabled = false
+ 	// Set timerDestroyed to prevent t.tick() from mutating timer state.
+ 	t.pauseState = timerDestroyed
++	untrackDeadline(t.clock, t)
+ 	t.mu.Unlock()
+ 	t.kicker.Stop()
+ 	// Unregister t.entry, ensuring that the Clock will not send to t.events,
+@@ -144,6 +145,7 @@ func (t *SampledTimer) Pause() {
+ 		return
+ 	}
+ 	t.pauseState = timerPaused
++	untrackDeadline(t.clock, t)
+ 	// t.kicker may be nil if we were restored but never resumed.
+ 	if t.kicker != nil {
+ 		t.kicker.Stop()
+@@ -257,6 +259,7 @@ func (t *SampledTimer) SetWithClock(c SampledClock, s Setting, f func()) (Time,
+ 	newNow := now
+ 	if oldC := t.clock; oldC != c {
+ 		oldC.EventUnregister(&t.entry)
++		untrackDeadline(oldC, t)
+ 		if err := c.EventRegister(&t.entry); err != nil {
+ 			panic(err)
+ 		}
+@@ -287,6 +290,7 @@ func (t *SampledTimer) SetClock(c SampledClock, s Setting) {
+ 	t.setting = s
+ 	if oldC := t.clock; oldC != c {
+ 		oldC.EventUnregister(&t.entry)
++		untrackDeadline(oldC, t)
+ 		if err := c.EventRegister(&t.entry); err != nil {
+ 			panic(err)
+ 		}
+@@ -338,6 +342,9 @@ func (t *SampledTimer) tick() {
+ 
+ // +checklocks:t.mu
+ func (t *SampledTimer) resetKickerLocked(now Time) {
++	if dt, ok := t.clock.(DeadlineTracker); ok {
++		dt.TrackDeadline(t, t.setting)
++	}
+ 	if t.setting.Enabled {
+ 		// Clock.WallTimeUntil may return a negative value. This is fine;
+ 		// time.when treats negative Durations as 0.
+@@ -439,3 +446,18 @@ func (c *ClockEventsQueue) EventRegister(e *waiter.Entry) error {
+ func (*ClockEventsQueue) Readiness(mask waiter.EventMask) waiter.EventMask {
+ 	return 0
+ }
++
++// DeadlineTracker is implemented by clocks that want to know the deadline of
++// every armed timer, so that a time-skipping controller can find the earliest
++// one. (Tesseract time skipping.)
++type DeadlineTracker interface {
++	// TrackDeadline records s as the current setting of timer key. A disabled
++	// setting removes the timer.
++	TrackDeadline(key *SampledTimer, s Setting)
++}
++
++func untrackDeadline(c SampledClock, t *SampledTimer) {
++	if dt, ok := c.(DeadlineTracker); ok {
++		dt.TrackDeadline(t, Setting{})
++	}
++}
+diff --git a/pkg/sentry/socket/hostinet/socket.go b/pkg/sentry/socket/hostinet/socket.go
+index c860e6a..ddde8c0 100644
+--- a/pkg/sentry/socket/hostinet/socket.go
++++ b/pkg/sentry/socket/hostinet/socket.go
+@@ -231,6 +231,7 @@ func (s *Socket) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.Read
+ 	reader := hostfd.GetReadWriterAt(int32(s.fd), -1, opts.Flags)
+ 	defer hostfd.PutReadWriterAt(reader)
+ 	n, err := dst.CopyOutFrom(ctx, reader)
++	s.countRx(int64(n))
+ 	return int64(n), err
+ }
+ 
+@@ -269,6 +270,7 @@ func (s *Socket) Write(ctx context.Context, src usermem.IOSequence, opts vfs.Wri
+ 	writer := hostfd.GetReadWriterAt(int32(s.fd), -1, opts.Flags)
+ 	defer hostfd.PutReadWriterAt(writer)
+ 	n, err := src.CopyInTo(ctx, writer)
++	s.countTx(int64(n))
+ 	return int64(n), err
+ }
+ 
+@@ -720,9 +722,27 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
+ 	if err != nil {
+ 		return 0, 0, nil, 0, socket.ControlMessages{}, syserr.FromError(err)
+ 	}
++	if flags&unix.MSG_PEEK == 0 {
++		s.countRx(int64(n))
++	}
+ 	return int(n), msgFlags, senderAddr, uint32(len(senderAddrBuf)), parseUnixControlMessages(unixControlMessages), nil
+ }
+ 
++// countTx and countRx keep Tesseract's in-flight byte accounting: bytes
++// written to TCP sockets minus bytes read from them, summed over every
++// sandbox in a world, is the number of bytes still in flight.
++func (s *Socket) countTx(n int64) {
++	if n > 0 && s.stype == linux.SOCK_STREAM && (s.family == linux.AF_INET || s.family == linux.AF_INET6) {
++		kernel.TessNetTx.Add(uint64(n))
++	}
++}
++
++func (s *Socket) countRx(n int64) {
++	if n > 0 && s.stype == linux.SOCK_STREAM && (s.family == linux.AF_INET || s.family == linux.AF_INET6) {
++		kernel.TessNetRx.Add(uint64(n))
++	}
++}
++
+ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) socket.ControlMessages {
+ 	controlMessages := socket.ControlMessages{}
+ 	for _, unixCmsg := range unixControlMessages {
+@@ -927,6 +947,7 @@ func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flag
+ 		}
+ 	}
+ 
++	s.countTx(int64(n))
+ 	return int(n), syserr.FromError(err)
+ }
+ 
+diff --git a/runsc/boot/controller.go b/runsc/boot/controller.go
+index 85e2e2a..3925035 100644
+--- a/runsc/boot/controller.go
++++ b/runsc/boot/controller.go
+@@ -100,6 +100,7 @@ func (c *controller) registerHandlers() {
+ 	c.srv.Register(&control.Usage{Kernel: l.k})
+ 	c.srv.Register(&control.Metrics{})
+ 	c.srv.Register(&debug{})
++	c.srv.Register(&Tesseract{k: l.k})
+ 
+ 	if eps, ok := l.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
+ 		c.srv.Register(&Network{
+diff --git a/runsc/boot/tesseract.go b/runsc/boot/tesseract.go
+new file mode 100644
+index 0000000..572ee4d
+--- /dev/null
++++ b/runsc/boot/tesseract.go
+@@ -0,0 +1,39 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package boot
++
++import (
++	"time"
++
++	"gvisor.dev/gvisor/pkg/sentry/kernel"
++)
++
++// Tesseract exposes time-skipping control to a world coordinator (spike).
++type Tesseract struct {
++	k *kernel.Kernel
++}
++
++// State reports whether the sandbox is idle, its next timer deadline and its
++// in-flight byte counters.
++func (t *Tesseract) State(_ *struct{}, out *kernel.TessState) error {
++	*out = t.k.TessState()
++	return nil
++}
++
++// Skip moves every clock in the sandbox forward by *d nanoseconds.
++func (t *Tesseract) Skip(d *int64, _ *struct{}) error {
++	t.k.TessSkip(time.Duration(*d))
++	return nil
++}
+diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
+index 06a401f..6394f96 100644
+--- a/runsc/sandbox/sandbox.go
++++ b/runsc/sandbox/sandbox.go
+@@ -1050,6 +1050,12 @@ func (s *Sandbox) sandboxConnect() (*urpc.Client, error) {
+ 	return conn, nil
+ }
+ 
++// Connect opens a control connection to the sandbox (used by the Tesseract
++// world coordinator, which keeps one connection per sandbox).
++func (s *Sandbox) Connect() (*urpc.Client, error) {
++	return s.sandboxConnect()
++}
++
+ func (s *Sandbox) call(method string, arg, result any) error {
+ 	conn, err := s.sandboxConnect()
+ 	if err != nil {
+@@ -1082,6 +1088,12 @@ func sandboxProcessEnv(conf *config.Config, opts sandboxProcessEnvOptions) []str
+ 			env = append(env, "TMPDIR="+tmpDir)
+ 		}
+ 	}
++	// Tesseract: pass time-skipping settings through to the sentry.
++	for _, kv := range os.Environ() {
++		if strings.HasPrefix(kv, "TESS_") {
++			env = append(env, kv)
++		}
++	}
+ 	env = gvisorbinaries.WithEnforceRelease(env)
+ 	if opts.sentryUsesCgo {
+ 		// Platforms that use stub processes are not compatible with
+diff --git a/tools/tesscoord/main.go b/tools/tesscoord/main.go
+new file mode 100644
+index 0000000..92a453f
+--- /dev/null
++++ b/tools/tesscoord/main.go
+@@ -0,0 +1,154 @@
++// Copyright 2026 The gVisor Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Binary tesscoord is a Tesseract world coordinator (spike): it makes several
++// gVisor sandboxes share one clock. It skips time only when every sandbox is
++// idle and no bytes are in flight between them, and then moves every sandbox
++// forward by the same amount, to the earliest timer anywhere in the world.
++//
++// Usage: tesscoord -root DIR [-quantum 60s] [-grace 500us] [-ignore-inflight] ID...
++// Sandboxes must run with TESS_SKIP=coord.
++package main
++
++import (
++	"flag"
++	"fmt"
++	"os"
++	"time"
++
++	"gvisor.dev/gvisor/pkg/sentry/kernel"
++	"gvisor.dev/gvisor/pkg/urpc"
++	"gvisor.dev/gvisor/runsc/container"
++)
++
++var (
++	root           = flag.String("root", "", "runsc --root directory")
++	quantum        = flag.Duration("quantum", 0, "round skip targets up to a multiple of this")
++	grace          = flag.Duration("grace", 500*time.Microsecond, "idle time required in every sandbox")
++	poll           = flag.Duration("poll", 200*time.Microsecond, "poll interval")
++	ignoreInflight = flag.Bool("ignore-inflight", false, "skip even with bytes in flight (to show the hazard)")
++	statsEvery     = flag.Int("stats", 1000, "print a line every N skips")
++)
++
++func main() {
++	flag.Parse()
++	ids := flag.Args()
++	var conns []*urpc.Client
++	for _, id := range ids {
++		var c *container.Container
++		var err error
++		for i := 0; i < 100; i++ {
++			c, err = container.Load(*root, container.FullID{SandboxID: id, ContainerID: id}, container.LoadOpts{})
++			if err == nil {
++				break
++			}
++			time.Sleep(100 * time.Millisecond)
++		}
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "load %s: %v\n", id, err)
++			os.Exit(1)
++		}
++		conn, err := c.Sandbox.Connect()
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "connect %s: %v\n", id, err)
++			os.Exit(1)
++		}
++		conns = append(conns, conn)
++	}
++	states := make([]kernel.TessState, len(conns))
++	query := func() bool {
++		for i, c := range conns {
++			if err := c.Call("Tesseract.State", &struct{}{}, &states[i]); err != nil {
++				fmt.Fprintf(os.Stderr, "world ended: %v\n", err)
++				return false
++			}
++		}
++		return true
++	}
++	// Line every sandbox up on the same wall clock (the furthest ahead).
++	if !query() {
++		os.Exit(1)
++	}
++	var maxSkew int64
++	for _, s := range states {
++		maxSkew = max(maxSkew, s.SkewNs)
++	}
++	for i, c := range conns {
++		if d := maxSkew - states[i].SkewNs; d > 0 {
++			c.Call("Tesseract.Skip", &d, &struct{}{})
++		}
++	}
++	start := time.Now()
++	var skips, waitedInflight, exactSkips int64
++	var lastTx uint64
++	var skipped time.Duration
++	for {
++		time.Sleep(*poll)
++		if !query() {
++			break
++		}
++		idle, inflight, tx := true, int64(0), uint64(0)
++		next, hasNext := int64(1<<62), false
++		for _, s := range states {
++			if s.Running != 0 || s.IdleNs < int64(*grace) {
++				idle = false
++			}
++			inflight += int64(s.NetTx) - int64(s.NetRx)
++			tx += s.NetTx
++			if s.HasNext && s.UntilNextNs < next {
++				next, hasNext = s.UntilNextNs, true
++			}
++		}
++		if !idle || !hasNext || next < int64(time.Millisecond) {
++			continue // busy, nothing armed, or a timer is (nearly) due and its owner is about to wake
++		}
++		if inflight != 0 && !*ignoreInflight {
++			waitedInflight++
++			continue
++		}
++		d := next
++		// Adaptive quantum: if the services talked to each other since the
++		// last skip, a conversation may be under way (a request waiting on a
++		// reply, with a timeout). Then jump exactly to the next deadline so
++		// events keep their order. Only when the world is quiet do we round
++		// up and batch timers.
++		talking := tx != lastTx
++		lastTx = tx
++		if talking {
++			exactSkips++
++		}
++		if q := int64(*quantum); q > 0 && !talking {
++			target := states[0].MonoNs + d
++			target = (target + q - 1) / q * q
++			d = target - states[0].MonoNs
++		}
++		for _, c := range conns {
++			if err := c.Call("Tesseract.Skip", &d, &struct{}{}); err != nil {
++				fmt.Fprintf(os.Stderr, "world ended: %v\n", err)
++				os.Exit(0)
++			}
++		}
++		skips++
++		skipped += time.Duration(d)
++		if (skips-1)%int64(*statsEvery) == 0 {
++			for i, st := range states {
++				fmt.Printf("  sandbox %s: world time %v, skew %v, next timer in %v\n", ids[i], time.Unix(0, st.RealNs).UTC().Format(time.RFC3339), time.Duration(st.SkewNs).Round(time.Second), time.Duration(st.UntilNextNs))
++			}
++			fmt.Printf("tesscoord: %d skips, %v of world time skipped in %v real, %d waits for in-flight bytes, %d exact skips\n",
++				skips, skipped.Round(time.Second), time.Since(start).Round(time.Millisecond), waitedInflight, exactSkips)
++		}
++	}
++	fmt.Printf("tesscoord: done: %d skips, %v skipped in %v real, %d waits for in-flight bytes, %d exact skips\n",
++		skips, skipped.Round(time.Second), time.Since(start).Round(time.Millisecond), waitedInflight, exactSkips)
++}
