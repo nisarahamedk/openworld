@@ -1,0 +1,23 @@
+{
+  "name": "@openworld/runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenWorld world runner: runs a product's commit through simulated days in a time-skipping gVisor world and reports invariants",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "start": "node --no-warnings src/server.ts",
+    "test": "node --no-warnings --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "1.19.9",
+    "hono": "4.10.6",
+    "yaml": "2.8.1",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.1",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,89 @@
+# OpenWorld runner on one k3s node. The pod is privileged because runsc (gVisor) must create its own namespaces and
+# trap syscalls; everything a PR brings (install scripts, build, the app) runs inside gVisor sandboxes, never in this
+# pod's own processes. Egress: the internet (GitHub, npm) but not the cluster's pods and services.
+# Image: built in-cluster (openfactory deploy/hetzner/build-image.sh), no registry. Secret `openworld` holds
+# OPENWORLD_TOKEN (API bearer) and GITHUB_TOKEN (read access to the repos it runs).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openworld
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: openworld-data, namespace: openworld }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: { requests: { storage: 20Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: openworld, namespace: openworld }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: openworld } }
+  template:
+    metadata: { labels: { app: openworld } }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: runner
+          image: openworld:IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext: { privileged: true }
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: OPENWORLD_PUBLIC_URL, value: "https://openworld.VM_IP.sslip.io" }
+            - { name: OPENWORLD_ALLOW_REPOS, value: "nisarahamedk/firstword" }
+            - { name: OPENWORLD_WORLD_TIMEOUT_MIN, value: "25" }
+          envFrom: [{ secretRef: { name: openworld } }]
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 3Gi }
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 10 }
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: openworld-data }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: openworld, namespace: openworld }
+spec:
+  selector: { app: openworld }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openworld
+  namespace: openworld
+  annotations:
+    traefik.ingress.kubernetes.io/router.tls.certresolver: le
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: openworld.VM_IP.sslip.io
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: openworld, port: { number: 8080 } } } }] }
+---
+# In: Traefik (kube-system) and the factory. Out: DNS, and anything outside the cluster's pod and service ranges.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: openworld, namespace: openworld }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: factory } }
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.42.0.0/16, 10.43.0.0/16, 169.254.169.254/32, 178.105.22.96/32]
