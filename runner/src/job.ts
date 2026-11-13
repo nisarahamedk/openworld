@@ -66,6 +66,7 @@ async function build(env: JobEnv, runDir: string, label: string, appDir: string,
   const r = await runInSandbox({
     runsc: env.runsc,
     workDir: join(runDir, "sandbox"),
+    stateRoot: join(env.dataDir, "runsc"),
     id: `ow-build-${label}-${Date.now()}`,
     args: ["/bin/sh", "-c", script],
     cwd: appDir,
@@ -93,6 +94,7 @@ async function runWorld(env: JobEnv, runDir: string, label: "head" | "base", app
   const r = await runInSandbox({
     runsc: env.runsc,
     workDir: join(runDir, "sandbox"),
+    stateRoot: join(env.dataDir, "runsc"),
     id: `ow-world-${label}-${Date.now()}`,
     args: [process.execPath, "--no-warnings", join(HERE, "host", "main.ts"), join(dir, "plan.json")],
     cwd: appDir,

@@ -66,7 +66,7 @@ export type CheckDetails = { routes: RouteRow[]; newErrorSignatures: { signature
 export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs | null): { invariants: Invariant[]; metrics: Metric[]; details: CheckDetails } {
   const inv: Invariant[] = [];
   const s = head.summary;
-  const vs = base ? " than base" : "";
+  
 
   // 1. The world ran.
   inv.push({
@@ -87,7 +87,7 @@ export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs
     ok: newErrors.length === 0,
     detail: newErrors.length
       ? `${newErrors.length} error kind(s) ${base ? "new or more frequent" : "seen"}: ${list(newErrors.map(([sig, n]) => `${n}× ${sig.slice(0, 140)}`))}`
-      : `${[...headErr.values()].reduce((a, b) => a + b, 0)} error lines, none new${vs}`,
+      : `${[...headErr.values()].reduce((a, b) => a + b, 0)} error lines, none new${base ? " compared with base" : ""}`,
   });
 
   // 3. Server errors by route.
@@ -98,7 +98,7 @@ export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs
   inv.push({
     name: "world: no new server errors",
     ok: bad5.length === 0,
-    detail: bad5.length ? list(bad5.map(([k, n]) => `${k}: ${n}× 5xx${base ? ` (base ${base5.get(k) ?? 0})` : ""}`)) : `${[...head5.values()].reduce((a, b) => a + b, 0)} 5xx of ${head.requests.length} requests, none new${vs}`,
+    detail: bad5.length ? list(bad5.map(([k, n]) => `${k}: ${n}× 5xx${base ? ` (base ${base5.get(k) ?? 0})` : ""}`)) : `${[...head5.values()].reduce((a, b) => a + b, 0)} 5xx of ${head.requests.length} requests, none new${base ? " compared with base" : ""}`,
   });
 
   // 4. Slow requests, per route.
@@ -135,7 +135,7 @@ export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs
     ok: slow.length === 0,
     detail: slow.length
       ? list(slow.map((r) => `${r.route} p95 ${Math.round(r.head.p95)} ms${r.base ? ` (base ${Math.round(r.base.p95)} ms)` : ""}`))
-      : `every route's p95 under ${limit} ms and not doubled${vs} (slowest: ${routes.filter((r) => r.head.n >= 5).sort((a, b) => b.head.p95 - a.head.p95)[0]?.route ?? "none"})`,
+      : `every route's p95 under ${limit} ms and not doubled${base ? " compared with base" : ""} (slowest: ${routes.filter((r) => r.head.n >= 5).sort((a, b) => b.head.p95 - a.head.p95)[0]?.route ?? "none"})`,
   });
 
   // 5. Duplicate rows.
@@ -147,7 +147,7 @@ export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs
     ok: newDup.length === 0,
     detail: newDup.length
       ? list(newDup.map((d) => `${d.table}: ${d.extraRows} duplicate row(s)${base ? ` (base ${baseDup.get(d.table) ?? 0})` : ""}, e.g. ${JSON.stringify(d.sample[0]).slice(0, 160)}`))
-      : `${head.data.duplicates.reduce((a, d) => a + d.extraRows, 0)} duplicate rows, none new${vs}`,
+      : `${head.data.duplicates.reduce((a, d) => a + d.extraRows, 0)} duplicate rows, none new${base ? " compared with base" : ""}`,
   });
 
   // 6. Orphans.
@@ -159,7 +159,7 @@ export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs
     ok: newOrph.length === 0,
     detail: newOrph.length
       ? list(newOrph.map((o) => `${o.rows} ${orphanKey(o)} row(s) point at nothing${base ? ` (base ${baseOrph.get(orphanKey(o)) ?? 0})` : ""}`))
-      : `${head.data.orphans.reduce((a, o) => a + o.rows, 0)} orphan rows, none new${vs}`,
+      : `${head.data.orphans.reduce((a, o) => a + o.rows, 0)} orphan rows, none new${base ? " compared with base" : ""}`,
   });
 
   // 7. Calls to services the world doesn't know.
@@ -190,7 +190,7 @@ export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs
   inv.push({
     name: "world: people's journeys complete",
     ok: newCr.length === 0,
-    detail: newCr.length ? `${newCr.length} journey(s) broke: ${list(newCr)}` : `${hcr.length} broken journeys, none new${vs}`,
+    detail: newCr.length ? `${newCr.length} journey(s) broke: ${list(newCr)}` : `${hcr.length} broken journeys, none new${base ? " compared with base" : ""}`,
   });
 
   // Team invariants: violated on any world day.

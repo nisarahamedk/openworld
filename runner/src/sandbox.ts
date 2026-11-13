@@ -9,8 +9,10 @@ import { join } from "node:path";
 
 export type SandboxOptions = {
   runsc: string;
-  /** Scratch for runsc's state and the OCI bundle. */
+  /** Scratch for the OCI bundle. */
   workDir: string;
+  /** runsc's state root; long-lived (it holds a netns bind mount that can't be deleted while mounted). */
+  stateRoot: string;
   id: string;
   args: string[];
   cwd: string;
@@ -30,7 +32,7 @@ const CAPS = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_
 
 export async function runInSandbox(o: SandboxOptions): Promise<SandboxResult> {
   const bundle = join(o.workDir, `bundle-${o.id}`);
-  const root = join(o.workDir, "runsc-root");
+  const root = o.stateRoot;
   mkdirSync(bundle, { recursive: true });
   mkdirSync(root, { recursive: true });
   const env = { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", HOME: "/tmp/home", LANG: "C.UTF-8", ...o.env };
