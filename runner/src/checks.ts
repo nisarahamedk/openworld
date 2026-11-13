@@ -194,7 +194,8 @@ export function evaluate(world: WorldFile, simDays: number, head: Obs, base: Obs
   });
 
   // Team invariants: violated on any world day.
-  for (const rule of world.invariants) {
+  const ruleNames = [...new Set([...world.invariants.map((i) => i.name), ...head.invariants.map((i) => i.name), ...(base?.invariants ?? []).map((i) => i.name)])];
+  for (const rule of ruleNames.map((name) => ({ name }))) {
     const worst = (o: Obs | null) => {
       const rows = (o?.invariants ?? []).filter((x) => x.name === rule.name);
       const bad = rows.filter((x) => x.violations > 0 || x.error);

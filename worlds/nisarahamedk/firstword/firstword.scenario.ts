@@ -20,6 +20,16 @@ export default async function firstword(world: World) {
   const stripe = world.twin<StripeTwin>("stripe");
   const checkNumber = world.vars.RETELL_CHECK_NUMBER as string;
 
+  // Rules that span the app and its providers, checked with the SQL ones at the end of every world day.
+  world.rule("every owner's own number is still held at Retell", async () => {
+    const rows = await world.app.sql("DB", "SELECT user_id, number FROM lines WHERE number IS NOT NULL AND shared = 0");
+    return rows.filter((r) => !retell.numbers.has(String(r.number)));
+  });
+  world.rule("Retell holds no number nobody uses", async () => {
+    const used = new Set((await world.app.sql("DB", "SELECT number FROM lines WHERE number IS NOT NULL")).map((r) => String(r.number)));
+    return [...retell.numbers.keys()].filter((n) => !used.has(n)).map((number) => ({ number }));
+  });
+
   // Owners arrive: 6 on day 0, then about one a day.
   let n = 0;
   const arrive = () => {

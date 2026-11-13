@@ -46,6 +46,14 @@ function log(level: string, text: string) {
 }
 
 async function runInvariants(world: World, app: HostedApp) {
+  for (const rule of world.rules) {
+    try {
+      const bad = await rule.check();
+      obs.add("invariants", { t: Date.now(), day: world.day(), name: rule.name, violations: bad.length, sample: bad.slice(0, 3), error: null });
+    } catch (e) {
+      obs.add("invariants", { t: Date.now(), day: world.day(), name: rule.name, violations: 0, sample: [], error: String(e) });
+    }
+  }
   for (const inv of plan.world.invariants) {
     try {
       const rows = await app.sql(inv.db, inv.sql);

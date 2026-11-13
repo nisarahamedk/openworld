@@ -178,6 +178,12 @@ export class World {
     return new Response([101, 204, 205, 304].includes(res.status) ? null : text, { status: res.status, headers: res.headers });
   }
 
+  /** Rules written in code (they can read twins' state too): each returns the things that break it. */
+  readonly rules: { name: string; check: () => Promise<unknown[]> }[] = [];
+  rule(name: string, check: () => Promise<unknown[]>): void {
+    this.rules.push({ name, check });
+  }
+
   /** Records something the scenario did, for the report's timeline. */
   note(what: string, data: Record<string, unknown> = {}): void {
     this.obs.add("timeline", { t: Date.now(), day: this.day(), what, ...data });
