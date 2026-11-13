@@ -1,0 +1,4 @@
+**/node_modules
+engine/gvisor/out
+engine/gvisor/.work
+.git

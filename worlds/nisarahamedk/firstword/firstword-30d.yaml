@@ -1,0 +1,79 @@
+# FirstWord's world: owners sign up, check their carrier, go live on a plan, and get calls from their clients for 30
+# days, while the hourly sweep, the number reconciler and Stripe's subscription clock run on world time.
+# This copy ships with the runner; a copy at .openworld/firstword-30d.yaml in the FirstWord repo wins.
+name: firstword-30d
+description: Owners from sign-up to live, calls, plans renewing and ending, accounts closing
+app:
+  adapter: cloudflare-worker
+  prepare:
+    - pnpm install --frozen-lockfile --prefer-offline
+    - pnpm vite build
+  config: dist/server/wrangler.json
+  d1Migrations:
+    DB: drizzle/migrations
+  origin: https://app.world.test
+  # Production's second cron (alchemy.run.ts) buys the numbers Go live recorded.
+  extraCrons: ["* * * * *"]
+  cronEvery:
+    "* * * * *": 10m
+  vars:
+    APP_URL: https://app.world.test
+    AUTHORIZED_PARTIES: https://app.world.test
+    NODE_ENV: production
+    CLERK_SECRET_KEY: sk_test_world
+    CLERK_PUBLISHABLE_KEY: pk_test_d29ybGQuY2xlcmsuYWNjb3VudHMuZGV2JA==
+    RETELL_API_KEY: key_world_retell
+    RETELL_AGENT_ID: agent_world
+    RETELL_CHECK_AGENT_ID: agent_world_check
+    RETELL_CHECK_NUMBER: "+15550100002"
+    RETELL_TRIAL_NUMBER_US: "+15550100001"
+    RETELL_TRIAL_NUMBER_CA: "+15550100003"
+    MAX_OWNED_NUMBERS: "50"
+    MAX_NUMBERS_PER_DAY: "10"
+    OPEN_SPOTS: "200"
+    STRIPE_SECRET_KEY: sk_test_world
+    STRIPE_PRICE_STARTER: price_world_starter
+    STRIPE_PRICE_PRO: price_world_pro
+    STRIPE_PRICE_TOP_UP: price_world_top_up
+    STRIPE_PORTAL_CONFIGURATION: bpc_world
+    RESEND_API_KEY: re_world
+    ALERT_EMAIL_FROM: FirstWord <alerts@world.test>
+    EXECUTOR_URL: https://executor.world.test
+    EXECUTOR_ADMIN_EMAIL: admin@world.test
+    EXECUTOR_ADMIN_PASSWORD: world
+    GOOGLE_OAUTH_CLIENT_ID: world
+    GOOGLE_OAUTH_CLIENT_SECRET: world
+twins:
+  api.clerk.com: clerk
+  api.retellai.com: retell
+  api.stripe.com: stripe
+  api.resend.com: sink
+  us.i.posthog.com: sink
+  executor.world.test: sink
+  catalog.executor.sh: sink
+scenario: firstword.scenario.ts
+seed: 20261113
+checks:
+  slowRequestMs: 1000
+  # Append-only histories where two equal rows are normal.
+  duplicatesIgnore: [state_changes, effects, actions]
+invariants:
+  - name: no two owners share a number
+    description: A bought number rings exactly one owner.
+    sql: >-
+      SELECT number, count(*) AS owners FROM lines
+      WHERE number IS NOT NULL AND shared = 0 GROUP BY number HAVING count(*) > 1
+  - name: number purchases settle within an hour
+    description: Go live records a purchase; the reconciler must buy it (or fail it) soon after.
+    sql: >-
+      SELECT id, user_id, attempts FROM number_purchases
+      WHERE status = 'pending' AND created_at < (unixepoch('subsec') * 1000) - 3600000
+  - name: a live own number has a plan that serves
+    description: Nobody keeps a paid-for number after their plan ended.
+    sql: >-
+      SELECT l.user_id, s.status FROM lines l LEFT JOIN subscriptions s ON s.user_id = l.user_id
+      WHERE l.status = 'live' AND l.shared = 0 AND (s.status IS NULL OR s.status = 'ended')
+  - name: at most one open number purchase per owner
+    sql: >-
+      SELECT user_id, count(*) AS open FROM number_purchases WHERE status = 'pending'
+      GROUP BY user_id HAVING count(*) > 1
