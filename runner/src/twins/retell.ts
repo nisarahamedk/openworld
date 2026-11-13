@@ -139,6 +139,12 @@ export class RetellTwin implements Twin {
       this.calls.set(call.call_id, call);
       return Response.json({ ...call, call_status: "registered", access_token: `world_${call.call_id}` }, { status: 201 });
     }
+    const delCall = /^\/v2\/delete-call\/(.+)$/.exec(path);
+    if (delCall && req.method === "DELETE") {
+      // Retell keeps calls it placed or answered; the world knows every call id it handed out.
+      this.calls.delete(decodeURIComponent(delCall[1] as string));
+      return new Response(null, { status: 204 });
+    }
     const get = /^\/v2\/get-call\/(.+)$/.exec(path);
     if (get) {
       const call = this.calls.get(decodeURIComponent(get[1] as string));

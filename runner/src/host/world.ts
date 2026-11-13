@@ -127,8 +127,13 @@ export class World {
     this.stopped = true;
   }
 
-  sleep(ms: number): Promise<void> {
-    return new Promise((r) => setTimeout(r, Math.max(0, ms)));
+  // setTimeout can't wait more than 2^31-1 ms (24.8 days) and fires at once beyond it, so long waits go in steps.
+  async sleep(ms: number): Promise<void> {
+    const until = Date.now() + Math.max(0, ms);
+    const MAX = 2 ** 31 - 1;
+    do {
+      await new Promise((r) => setTimeout(r, Math.min(MAX, Math.max(0, until - Date.now()))));
+    } while (Date.now() < until && until - Date.now() > 1);
   }
   until(t: number): Promise<void> {
     return this.sleep(t - Date.now());

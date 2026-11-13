@@ -5,7 +5,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import type { WorldFile } from "../../contract.ts";
-import type { HostedApp } from "../world.ts";
+import { holdClock, type HostedApp } from "../world.ts";
 
 type Rule = { type: string; globs: string[] };
 type BuiltConfig = {
@@ -110,9 +110,17 @@ export async function hostCloudflareWorker(opts: {
     crons: () => cfg.triggers?.crons ?? [],
     databases: () => d1,
     sql: async (binding, query) => {
-      const db = await mf.getD1Database(binding);
-      const out = await db.prepare(query).all();
-      return out.results as Record<string, unknown>[];
+      const once = async () => (await (await mf.getD1Database(binding)).prepare(query).all()).results as Record<string, unknown>[];
+      const release = holdClock();
+      try {
+        return await once();
+      } catch (e) {
+        // Same stale keep-alive connection after a skip as World.fetch retries; a real SQL error fails again.
+        if (!String(e).includes("fetch failed")) throw e;
+        return await once();
+      } finally {
+        release();
+      }
     },
     dispose: () => mf.dispose(),
   };

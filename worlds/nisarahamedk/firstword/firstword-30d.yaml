@@ -56,7 +56,7 @@ seed: 20261113
 checks:
   slowRequestMs: 1000
   # Append-only histories where two equal rows are normal.
-  duplicatesIgnore: [state_changes, effects]
+  duplicatesIgnore: [state_changes, effects, actions]
 invariants:
   - name: no two owners share a number
     description: A bought number rings exactly one owner.
